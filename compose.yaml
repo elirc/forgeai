@@ -1,0 +1,18 @@
+services:
+  postgres:
+    image: postgres:17.10-alpine
+    environment:
+      POSTGRES_USER: forge
+      POSTGRES_PASSWORD: forge_local_only
+      POSTGRES_DB: forge
+    ports:
+      - '127.0.0.1:54329:5432'
+    volumes:
+      - forge-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U forge -d forge']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+volumes:
+  forge-postgres:

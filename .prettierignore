@@ -1,0 +1,13 @@
+node_modules
+.cache
+.local
+.next
+dist
+package-lock.json
+playwright-report
+test-results
+docs/FORGE_MASTER_BUILD_PROMPT.md
+
+.next-e2e/
+
+**/next-env.d.ts
