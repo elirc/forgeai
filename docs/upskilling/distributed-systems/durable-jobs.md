@@ -20,6 +20,16 @@ Committed outbox command → worker claim with SKIP LOCKED → lease token → e
 
 On error, persist a bounded code, incremented attempt count and next eligible time. After five attempts, move the job to dead letter.
 
+Exact places to read (`apps/api/src/platform/jobs.ts` unless noted):
+
+- **Claim** (`claimJob`, `:24-41`). One transaction does two things. It first dead-letters any job that has used its `MAX_ATTEMPTS = 5` budget and is pending or holds an expired lease (`:26-30`). It then claims the oldest eligible job with `FOR UPDATE SKIP LOCKED LIMIT 1`, increments `attempts`, and writes a fresh `lease_token` (a random UUID) with `lease_until = now() + 30 seconds` (`:31-38`). A `running` job whose lease has expired is eligible again. That is how a crashed worker's job is recovered.
+- **Contract check** (`:46-52`). The payload must be exactly `{ orderId: uuid }`, `type` must be `payment.requested`, `schema_version` must be 1, and `orderId` must equal `aggregate_id`. Anything else becomes `INVALID_EVENT_CONTRACT`.
+- **Provider call** (`payments/provider.ts:22-54`). The simulator first looks up `simulated_provider_payments` by `idempotency_key = orderId` (`:28-36`) and returns any prior result, unless the amount differs (`PROVIDER_IDEMPOTENCY_CONFLICT`). The `payment_timeout` chaos mode inserts the charge and _then_ throws, on attempt 1 only (`:51-52`).
+- **Fenced finalization** (`payments/service.ts:18-63`). Inside one transaction, the job row must still match `lease_token = $2 AND state = 'running' AND lease_until > now()` (`:19-23`). The order row is then locked `FOR UPDATE` (`:24-27`), and the outcome is applied only while the order is `awaiting_payment` (`:31`). A stale worker gets zero rows and returns `false` without writing anything.
+- **Failure path** (`:78-89`). The job is set back to `pending`, or to `dead` once `attempts >= 5`, again guarded by `lease_token = $2 AND state = 'running'`. Retry delay is `retryDelayMs(attempt) = min(60 s, 1 s × 2^(attempt-1)) × (0.5 … 1.0 jitter)` (`:19-23`).
+
+Replay of a dead job is an admin-only, audited API call that resets `attempts` to 0 (`apps/api/src/app.ts:249-269`).
+
 ## Failure scenario
 
 Worker A captures payment, pauses, and loses its lease. Worker B claims the job. If A resumes, a fencing check prevents it from committing as the current owner. B can retrieve the same provider payment and finalize once.
@@ -39,6 +49,8 @@ PostgreSQL jobs keep the first deployment simple and allow atomic enqueueing. Hi
 ## Exercise
 
 Enable the timeout scenario and follow one order's two attempts. Verify one provider row, one notification, and a confirmed order.
+
+**Check:** the test "recovers timeout-after-capture without a second charge" asserts the provider row count, the order status, and `attempts = 2`. It does **not** assert the notification or shipment counts. In a local branch, add `expect((await pool.query('SELECT * FROM notifications')).rowCount).toBe(1)` and the same for `shipments` after the second `processOneJob`. Then run `npm test -- -t "timeout-after-capture"` and confirm it passes. Next, temporarily replace `input.attempt === 1` in `provider.ts:51` with `true`, and predict whether the test still passes. (It does: on attempt 2 the idempotency lookup at `provider.ts:28-36` returns the stored charge before the code reaches the throw.) Run the test to confirm, explain what that says about where the provider's idempotency lives, then restore the line.
 
 ## Debugging challenge
 

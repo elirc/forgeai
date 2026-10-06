@@ -18,14 +18,35 @@ Read [commerce/service.ts](../../../apps/api/src/modules/commerce/service.ts), [
 
 HTTP input → runtime validation → authorized principal → scoped idempotency lock → order and lines → conditional stock reservation → payment intent → durable job → audit → commit.
 
+This is the real statement from `reserve` (`inventory/service.ts:13-19`):
+
 ```sql
-UPDATE inventory
-SET reserved = reserved + $3
-WHERE tenant_id=$1 AND product_id=$2
-  AND on_hand-reserved >= $3;
+UPDATE inventory SET reserved = reserved + $3
+WHERE tenant_id=$1 AND product_id=$2 AND warehouse_id = (
+  SELECT warehouse_id FROM inventory WHERE tenant_id=$1 AND product_id=$2 ORDER BY warehouse_id LIMIT 1
+) AND on_hand - reserved >= $3 RETURNING warehouse_id
 ```
 
-The actual query also restricts the initial warehouse. Under PostgreSQL's default READ COMMITTED isolation, a conflicting updater waits and rechecks the condition against the updated row. No returned row means insufficient stock.
+The subquery picks the tenant's first warehouse, which matches the one-warehouse policy in the README. Under PostgreSQL's default READ COMMITTED isolation, a conflicting updater waits and then rechecks the condition against the updated row. If no row is returned, the stock was insufficient, and `reserve` throws `409 INSUFFICIENT_STOCK` (`inventory/service.ts:20-25`).
+
+Line by line through `checkout` (`commerce/service.ts:32-134`):
+
+| Lines     | What happens                                                                                                                                   | Why                                                                                                                                                        |
+| --------- | ---------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `40-44`   | Lines are sorted by product ID, then the request is fingerprinted with SHA-256                                                                 | The same cart in any order gets the same fingerprint. The row-lock order itself comes from `ORDER BY id` at `:69`, and the reservations follow that order. |
+| `47-49`   | `pg_advisory_xact_lock(hashtextextended(tenant:user:key))`                                                                                     | Two concurrent retries with the same key queue up instead of both inserting                                                                                |
+| `50-62`   | Look up an existing order for `(tenant, actor, key)`. A different fingerprint returns 409 `IDEMPOTENCY_CONFLICT`; the same fingerprint replays | Idempotency is scoped to the actor and checks the payload too                                                                                              |
+| `63-73`   | `SELECT ... FOR SHARE` on the tenant's products                                                                                                | Price and name are read under a share lock, so a concurrent edit cannot change them mid-checkout                                                           |
+| `79-113`  | Insert the order and the snapshot lines, and reserve each product                                                                              | All on the same `client`                                                                                                                                   |
+| `114-130` | Insert the payment intent, the `payment.requested` job and the audit row                                                                       | The outbox write commits or rolls back with the order                                                                                                      |
+| `133`     | `getOrder` runs **after** commit, on the pool                                                                                                  | The response reflects committed state                                                                                                                      |
+
+The `transaction` helper (`packages/database/src/index.ts:21-43`) does the following:
+
+- checks out one client;
+- sets `lock_timeout = '5s'` (`:29`);
+- commits or rolls back;
+- releases the client with `discard = true` if `ROLLBACK` itself failed (`:41`), so a broken connection is not returned to the pool.
 
 ## Failure scenario
 
@@ -46,6 +67,8 @@ Reserving before capture temporarily reduces availability. It avoids selling alr
 ## Exercise
 
 Run `npm test -- -t "competing purchase"`. Explain the two response statuses and why only one outbox row exists.
+
+**Check:** your explanation names `201` for the winner and `409 INSUFFICIENT_STOCK` for the loser, and points at the `RETURNING warehouse_id` row count as the decision. Confirm it against the assertions in the test "allows exactly one competing purchase of the last item" in `tests/integration.test.ts`. Then run `npm test -- -t "coalesces concurrent retries"`, and explain which line of `checkout` makes the two same-key requests return one order.
 
 ## Debugging challenge
 
